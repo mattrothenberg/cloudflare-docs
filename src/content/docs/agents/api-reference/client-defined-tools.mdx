@@ -1,0 +1,476 @@
+---
+title: Client-Defined Tools
+pcx_content_type: reference
+sidebar:
+  order: 12
+tags:
+  - AI
+  - Tools
+---
+
+import { TypeScriptExample, PackageManagers } from "~/components";
+
+Client-defined tools allow you to register tools dynamically from the browser that execute on the client side. This is useful for scenarios where each client needs different capabilities, such as embeddable chat widgets or multi-tenant applications.
+
+## Overview
+
+With client-defined tools, you can:
+
+1. Define tools in your React components that execute client-side actions (like showing alerts, manipulating the DOM, accessing local storage)
+2. Automatically send tool schemas to the server with each request
+3. Have the AI model decide when to call these tools
+4. Execute the tools on the client and return results to the AI
+
+This approach is ideal for:
+
+- **Embeddable widgets** where each embedding site needs different tools
+- **Multi-tenant applications** where different users have different capabilities
+- **Dynamic tool registration** based on user permissions or context
+- **Browser-specific actions** that cannot be performed server-side
+
+## Basic usage
+
+### Client-side tool definition
+
+Define tools with both a schema (using JSON Schema) and an `execute` function:
+
+<TypeScriptExample>
+
+```tsx title="src/components/chat.tsx"
+import { useAgent } from "agents/react";
+import { useAgentChat, type AITool } from "agents/ai-react";
+
+// Define tools outside component to avoid recreation on every render
+const tools: Record<string, AITool> = {
+  showAlert: {
+    description: "Shows an alert dialog to the user",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string" }
+      },
+      required: ["message"]
+    },
+    execute: async (input) => {
+      const { message } = input as { message: string };
+      alert(message);
+      return { success: true };
+    }
+  },
+  changeBackgroundColor: {
+    description: "Changes the page background color",
+    parameters: {
+      type: "object",
+      properties: {
+        color: { type: "string" }
+      }
+    },
+    execute: async (input) => {
+      const { color } = input as { color: string };
+      document.body.style.backgroundColor = color;
+      return { success: true, color };
+    }
+  }
+};
+
+function EmbeddableChat() {
+  const agent = useAgent({ agent: "chat-widget" });
+
+  const { messages, input, handleInputChange, handleSubmit } = useAgentChat({
+    agent,
+    tools // Schema + execute in one place
+  });
+
+  return (
+    <div className="chat-widget">
+      {messages.map((message) => (
+        <div key={message.id}>
+          {message.parts.map((part, i) => {
+            if (part.type === "text") return <span key={i}>{part.text}</span>;
+            return null;
+          })}
+        </div>
+      ))}
+      <form onSubmit={handleSubmit}>
+        <input value={input} onChange={handleInputChange} />
+      </form>
+    </div>
+  );
+}
+```
+
+</TypeScriptExample>
+
+### Server-side tool handling
+
+On the server, use `createToolsFromClientSchemas` to convert client tool schemas to AI SDK format. These tools have no `execute` function - when the AI model calls them, the tool call is sent back to the client for execution.
+
+<TypeScriptExample>
+
+```typescript title="src/index.ts"
+import {
+  AIChatAgent,
+  createToolsFromClientSchemas
+} from "agents/ai-chat-agent";
+import { openai } from "@ai-sdk/openai";
+import { streamText, tool } from "ai";
+import { z } from "zod";
+
+export class ChatWidget extends AIChatAgent {
+  async onChatMessage(onFinish, options) {
+    const result = streamText({
+      model: openai("gpt-4o"),
+      messages: this.messages,
+      tools: {
+        // Server-side tools (execute on server)
+        getWeather: tool({
+          description: "Get weather for a city",
+          parameters: z.object({ city: z.string() }),
+          execute: async ({ city }) => {
+            // Fetch weather from API
+            const response = await fetch(
+              `https://api.weather.com/v1/current?city=${city}`
+            );
+            return await response.json();
+          }
+        }),
+        // Client-side tools (sent back to client for execution)
+        ...createToolsFromClientSchemas(options?.clientTools)
+      },
+      onFinish
+    });
+
+    return result.toUIMessageStreamResponse();
+  }
+}
+```
+
+</TypeScriptExample>
+
+## How it works
+
+1. **Tool Registration**: When you pass `tools` to `useAgentChat`, the hook extracts the schemas (description and parameters) from each tool
+2. **Request Enhancement**: These schemas are automatically included in the request body sent to the server as `clientTools`
+3. **Server Processing**: The server receives the schemas and converts them to AI SDK tool format using `createToolsFromClientSchemas()`
+4. **AI Decision**: The AI model decides when to call these tools based on the conversation context
+5. **Client Execution**: When a client tool is called, the tool call is sent back to the client where the `execute` function runs
+6. **Result Return**: The execution result is sent back to the server and the conversation continues
+
+## Advanced usage
+
+### Custom request data
+
+For additional control over the request (custom headers, dynamic context), use `prepareSendMessagesRequest`:
+
+<TypeScriptExample>
+
+```tsx title="src/components/chat.tsx"
+const { messages, handleSubmit } = useAgentChat({
+  agent,
+  tools, // Tool schemas auto-extracted and sent
+  prepareSendMessagesRequest: ({ id, messages }) => ({
+    body: {
+      // Add dynamic context alongside auto-extracted tool schemas
+      currentUrl: window.location.href,
+      userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      sessionId: getCurrentSessionId()
+    },
+    headers: {
+      "X-Widget-Version": "1.0.0",
+      "X-Request-ID": crypto.randomUUID()
+    }
+  })
+});
+```
+
+</TypeScriptExample>
+
+### Accessing custom request data on server
+
+<TypeScriptExample>
+
+```typescript title="src/index.ts"
+export class ChatWidget extends AIChatAgent {
+  async onChatMessage(onFinish, options) {
+    // Access custom data from the request
+    const requestBody = await this.request.json();
+    const { currentUrl, userTimezone, sessionId } = requestBody;
+
+    console.log("User context:", { currentUrl, userTimezone, sessionId });
+
+    const result = streamText({
+      model: openai("gpt-4o"),
+      messages: this.messages,
+      system: `You are a helpful assistant. The user is currently at ${currentUrl} in ${userTimezone} timezone.`,
+      tools: {
+        ...createToolsFromClientSchemas(options?.clientTools)
+      },
+      onFinish
+    });
+
+    return result.toUIMessageStreamResponse();
+  }
+}
+```
+
+</TypeScriptExample>
+
+### Mixing server and client tools
+
+You can seamlessly mix server-side tools (that execute on the server) with client-side tools:
+
+<TypeScriptExample>
+
+```typescript title="src/index.ts"
+tools: {
+  // Server-side tools
+  fetchUserData: tool({
+    description: "Fetch user data from database",
+    parameters: z.object({ userId: z.string() }),
+    execute: async ({ userId }) => {
+      // Access database, environment variables, etc.
+      return await this.env.DB.get(userId);
+    }
+  }),
+  sendEmail: tool({
+    description: "Send an email to the user",
+    parameters: z.object({
+      to: z.string(),
+      subject: z.string(),
+      body: z.string()
+    }),
+    execute: async ({ to, subject, body }) => {
+      // Use server-side email service
+      await this.env.EMAIL_SERVICE.send({ to, subject, body });
+      return { sent: true };
+    }
+  }),
+  // Client-side tools (from browser)
+  ...createToolsFromClientSchemas(options?.clientTools)
+}
+```
+
+</TypeScriptExample>
+
+## API reference
+
+### AITool type
+
+```typescript
+type AITool = {
+  description: string;
+  parameters?: JSONSchema7;
+  execute?: (input: unknown) => Promise<unknown>;
+};
+```
+
+**Properties:**
+
+- **description** (string) - Human-readable description of what the tool does. This helps the AI understand when to use the tool.
+- **parameters** (JSONSchema7, optional) - JSON Schema defining the tool's input parameters. Only required for tools with `execute` functions.
+- **execute** (function, optional) - Async function that executes the tool action. If present, this tool will be executed on the client.
+
+### createToolsFromClientSchemas()
+
+```typescript
+function createToolsFromClientSchemas(
+  clientTools?: ClientToolSchema[]
+): ToolSet;
+```
+
+Converts client tool schemas to AI SDK tool format. These tools have no `execute` function - when the AI model calls them, the tool call is sent back to the client for execution.
+
+**Parameters:**
+
+- **clientTools** (ClientToolSchema[], optional) - Array of tool schemas from the client
+
+**Returns:**
+
+- **ToolSet** - Record of AI SDK tools that can be spread into your tools object
+
+**Example:**
+
+```typescript
+const result = streamText({
+  model: openai("gpt-4o"),
+  messages: this.messages,
+  tools: {
+    serverTool: tool({ ... }),
+    ...createToolsFromClientSchemas(options?.clientTools)
+  }
+});
+```
+
+### ClientToolSchema type
+
+```typescript
+type ClientToolSchema = {
+  name: string;
+  description?: string;
+  parameters?: JSONSchema7;
+};
+```
+
+This is the wire format for tools sent from the client to the server. The schemas are automatically extracted from your `AITool` definitions.
+
+### OnChatMessageOptions type
+
+```typescript
+type OnChatMessageOptions = {
+  abortSignal?: AbortSignal;
+  clientTools?: ClientToolSchema[];
+};
+```
+
+Options passed to the `onChatMessage` handler.
+
+**Properties:**
+
+- **abortSignal** (AbortSignal, optional) - Signal for cancelling the request
+- **clientTools** (ClientToolSchema[], optional) - Tool schemas sent from the client for dynamic tool registration
+
+## Best practices
+
+### Define tools outside components
+
+Define tools outside your component to avoid recreation on every render:
+
+```tsx
+// Good
+const tools = { ... };
+
+function MyComponent() {
+  const { messages } = useAgentChat({ agent, tools });
+}
+
+// Bad - tools recreated on every render
+function MyComponent() {
+  const { messages } = useAgentChat({
+    agent,
+    tools: { ... }
+  });
+}
+```
+
+### Handle errors gracefully
+
+Tool execution can fail. Always handle errors in your `execute` functions:
+
+```tsx
+const tools: Record<string, AITool> = {
+  fetchData: {
+    description: "Fetch data from an API",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string" }
+      }
+    },
+    execute: async (input) => {
+      try {
+        const { url } = input as { url: string };
+        const response = await fetch(url);
+        if (!response.ok) {
+          return { error: `HTTP ${response.status}: ${response.statusText}` };
+        }
+        return await response.json();
+      } catch (error) {
+        return { error: error.message };
+      }
+    }
+  }
+};
+```
+
+### Use TypeScript for type safety
+
+Define types for your tool inputs and outputs:
+
+```tsx
+type ShowAlertInput = {
+  message: string;
+  severity?: "info" | "warning" | "error";
+};
+
+type ShowAlertOutput = {
+  success: boolean;
+  timestamp: number;
+};
+
+const tools: Record<string, AITool> = {
+  showAlert: {
+    description: "Shows an alert dialog to the user",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string" },
+        severity: {
+          type: "string",
+          enum: ["info", "warning", "error"]
+        }
+      },
+      required: ["message"]
+    },
+    execute: async (input): Promise<ShowAlertOutput> => {
+      const { message, severity = "info" } = input as ShowAlertInput;
+      // Type-safe execution
+      alert(`[${severity.toUpperCase()}] ${message}`);
+      return { success: true, timestamp: Date.now() };
+    }
+  }
+};
+```
+
+### Security considerations
+
+Client-defined tools execute in the browser with access to user data and APIs. Always:
+
+1. **Validate inputs** - Even though the AI generates tool calls, validate all inputs in your `execute` functions
+2. **Limit scope** - Only provide tools with necessary permissions
+3. **Sanitize outputs** - Be careful with XSS when rendering tool results
+4. **Rate limit** - Consider rate limiting tool execution to prevent abuse
+
+```tsx
+const tools: Record<string, AITool> = {
+  executeCode: {
+    description: "Execute JavaScript code",
+    parameters: {
+      type: "object",
+      properties: {
+        code: { type: "string" }
+      }
+    },
+    execute: async (input) => {
+      const { code } = input as { code: string };
+
+      // Validate and sanitize
+      if (!code || typeof code !== "string") {
+        return { error: "Invalid code" };
+      }
+
+      // Limit what can be executed
+      const allowedAPIs = ["console.log", "Math", "Date"];
+      const hasDisallowedAPI = !allowedAPIs.some((api) => code.includes(api));
+
+      if (hasDisallowedAPI) {
+        return { error: "Code uses disallowed APIs" };
+      }
+
+      try {
+        // Safe execution in limited scope
+        const result = Function(`"use strict"; return (${code})`)();
+        return { result };
+      } catch (error) {
+        return { error: error.message };
+      }
+    }
+  }
+};
+```
+
+## Related resources
+
+- [Using AI Models](/agents/api-reference/using-ai-models/) - Learn about integrating AI models with Agents
+- [Tools (Concepts)](/agents/concepts/tools/) - Understand the broader concept of tools in AI systems
+- [Model Context Protocol Tools](/agents/model-context-protocol/tools/) - Learn about server-side tool definitions using MCP
+- [AI SDK Tool Calling](https://sdk.vercel.ai/docs/ai-sdk-core/tools-and-tool-calling) - Deep dive into the AI SDK's tool calling capabilities
